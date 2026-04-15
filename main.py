@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware # Added CORS import
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pdfplumber
 import re
@@ -7,10 +7,11 @@ import io
 import gc
 import traceback
 import sys
+from collections import defaultdict, Counter # 🔥 Importes nativos para matemática
 
 app = FastAPI(title="Extrator PDF PUCRS")
 
-# Added CORS configuration
+# CONFIGURAÇÃO DE CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -132,6 +133,9 @@ async def root():
         "docs": "/docs" 
     }
     
+# ---------------------------------------------------------
+# ROTA 1: EXTRATOR CRU (Usada para salvar no Banco de Dados)
+# ---------------------------------------------------------
 @app.post("/extract-pdf")
 async def extract_pdf_endpoint(file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
@@ -146,19 +150,111 @@ async def extract_pdf_endpoint(file: UploadFile = File(...)):
                 records = extract_page(page)
                 all_records.extend(records)
                 
-                try:
-                    page.flush_cache()
-                except AttributeError:
-                    pass
+                try: page.flush_cache()
+                except AttributeError: pass
                 
         gc.collect()
-                
-        if not all_records:
-            raise HTTPException(status_code=422, detail="Nenhum dado encontrado no PDF. Verifique o formato.")
-            
+        if not all_records: raise HTTPException(status_code=422, detail="Nenhum dado encontrado.")
         return JSONResponse(content={"records": all_records})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# ROTA 2: MOTOR DE BUSINESS INTELLIGENCE (Usada pelo Dashboard)
+# ---------------------------------------------------------
+@app.post("/analyze-bi")
+async def analyze_bi_endpoint(file: UploadFile = File(...)):
+    """
+    Processa o PDF e já devolve as agregações matemáticas prontas 
+    para o frontend consumir nos gráficos do Recharts.
+    """
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="O arquivo deve ser um PDF")
+    
+    try:
+        file_bytes = await file.read()
+        all_records = []
+        
+        # 1. Extração Base
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                records = extract_page(page)
+                all_records.extend(records)
+                try: page.flush_cache()
+                except AttributeError: pass
+        gc.collect()
+        
+        if not all_records: 
+            raise HTTPException(status_code=422, detail="Nenhum dado encontrado no PDF.")
+
+        # 2. Processamento de Business Intelligence (BI)
+        salas_unicas = set()
+        heatmap_data = defaultdict(lambda: defaultdict(int)) # dia -> periodo -> contagem
+        ranking_salas = Counter() # sala -> contagem
+        curva_horario = Counter() # periodo -> contagem
+        distribuicao_turno = {"Manhã": 0, "Tarde": 0, "Noite": 0}
+
+        for r in all_records:
+            dia = r['Dia']
+            sala = r['Sala']
+            # Extrai apenas a letra do período (Ex: 'A' de 'A (08:00-08:45)')
+            periodo_letra = r['Periodo'].split(' ')[0] 
+            
+            salas_unicas.add(sala)
+            
+            # Agregações
+            heatmap_data[dia][periodo_letra] += 1
+            ranking_salas[sala] += 1
+            curva_horario[periodo_letra] += 1
+            
+            # Lógica de Turnos (PUCRS Padrão)
+            if periodo_letra in ['A', 'B', 'C', 'D', 'E', 'E1']:
+                distribuicao_turno["Manhã"] += 1
+            elif periodo_letra in ['F', 'G', 'H', 'I', 'J']:
+                distribuicao_turno["Tarde"] += 1
+            else:
+                distribuicao_turno["Noite"] += 1
+
+        # 3. Formatação da Resposta para o React
+        
+        # Formata Heatmap: [{'dia': 'Segunda', 'A': 5, 'B': 10...}]
+        heatmap_frontend = []
+        for d in DAYS:
+            if d in heatmap_data:
+                dia_obj = {"dia": d}
+                dia_obj.update(heatmap_data[d])
+                heatmap_frontend.append(dia_obj)
+
+        # Formata Ranking de Salas
+        ranking_frontend = [{"sala": s, "aulas": c} for s, c in ranking_salas.most_common()]
+
+        # Formata Curva de Horários (Ordenado pela ordem lógica dos turnos)
+        ordem_periodos = ['A', 'B', 'C', 'D', 'E', 'E1', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'P']
+        curva_frontend = [
+            {"horario": p, "salasOcupadas": curva_horario[p]} 
+            for p in ordem_periodos if p in curva_horario
+        ]
+
+        response_data = {
+            "kpis": {
+                "totalAulas": len(all_records),
+                "totalSalas": len(salas_unicas),
+                "salaMaisUsada": ranking_salas.most_common(1)[0][0] if ranking_salas else "N/A"
+            },
+            "heatmap": heatmap_frontend,
+            "rankingSalas": ranking_frontend,
+            "curvaHorario": curva_frontend,
+            "turnos": [
+                {"name": "Manhã", "value": distribuicao_turno["Manhã"]},
+                {"name": "Tarde", "value": distribuicao_turno["Tarde"]},
+                {"name": "Noite", "value": distribuicao_turno["Noite"]}
+            ],
+            "rawRecords": all_records # Mantemos cru para debug ou tabelas específicas
+        }
+            
+        return JSONResponse(content=response_data)
     
     except Exception as e:
-        print("🚨 ERRO FATAL NO ENDPOINT /extract-pdf:", file=sys.stderr)
+        print("🚨 ERRO FATAL NO ENDPOINT /analyze-bi:", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
