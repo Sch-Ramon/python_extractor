@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware # Added CORS import
 from fastapi.responses import JSONResponse
 import pdfplumber
 import re
@@ -8,6 +9,15 @@ import traceback
 import sys
 
 app = FastAPI(title="Extrator PDF PUCRS")
+
+# Added CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DAYS = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado']
 PERIOD_LABEL = {
